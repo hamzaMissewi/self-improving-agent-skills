@@ -21,30 +21,51 @@ from contextlib import asynccontextmanager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Upload/limit constants
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB total
-MAX_FILE_SIZE = 1 * 1024 * 1024     # 1 MB per file
+MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB per file
 MAX_FILE_COUNT = 50
 SESSION_TTL = 3600  # 1 hour
+COMPLETED_TTL = 15 * 60  # finished sessions pruned after 15 minutes
+SSE_QUEUE_MAX = 500  # bound the in-memory event queue
 ALLOWED_EXTENSIONS = {
-    ".md", ".txt", ".json", ".yaml", ".yml", ".py", ".js", ".ts",
-    ".html", ".css", ".xml", ".toml", ".cfg", ".ini", ".sh",
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".py",
+    ".js",
+    ".ts",
+    ".html",
+    ".css",
+    ".xml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".sh",
 }
 
 sessions: Dict[str, dict] = {}
 
 
 async def _cleanup_expired_sessions():
-    """Periodically remove sessions older than SESSION_TTL."""
+    """Periodically prune stale sessions to bound memory."""
     while True:
         await asyncio.sleep(300)  # every 5 minutes
         now = time.time()
-        expired = [
-            sid for sid, s in sessions.items()
-            if now - s.get("created_at", now) > SESSION_TTL
-            and s.get("status") not in ("running",)
-        ]
+        expired = []
+        for sid, s in sessions.items():
+            if s.get("status") == "running":
+                continue
+            age = now - s.get("created_at", now)
+            finished = s.get("status") in ("complete", "error", "stopped")
+            if age > SESSION_TTL or (finished and age > COMPLETED_TTL):
+                expired.append(sid)
         for sid in expired:
-            del sessions[sid]
+            s = sessions.pop(sid, None)
+            if s:
+                s.clear()
         if expired:
             logger.info(f"Cleaned up {len(expired)} expired session(s)")
 
@@ -67,11 +88,9 @@ app = FastAPI(title="Skill Optimizer API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 class AnalyzeRequest(BaseModel):
@@ -153,20 +172,84 @@ def _is_safe_path(name: str) -> bool:
     return ".." not in name and not os.path.isabs(name)
 
 
+async def _read_limited(upload: UploadFile, limit: int) -> bytes:
+    """Read an upload in chunks so huge files never load fully into RAM.
+
+    Raises 413 if the total size exceeds `limit`.
+    """
+    chunks = []
+    size = 0
+    while True:
+        chunk = await upload.read(64 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload exceeds {limit // (1024 * 1024)}MB limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _enqueue_event(session: dict, event):
+    """Append an event to a session's SSE queue without growing unbounded.
+
+    If the bounded queue is full, the oldest events are dropped so memory
+    stays flat and the newest progress always reaches connected clients.
+    """
+    queue = session.get("event_queue")
+    if queue is None:
+        return
+    while queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        pass
+
+
+def _discover_example_roots() -> List[str]:
+    """Locate directories that may contain example skills.
+
+    Repo root covers the checked-in project; hf-space/agent_skills is scanned
+    so the deployed app on Render still has working examples; the repo's
+    parent is included for local development where sibling skill projects live.
+    """
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(backend_dir)
+    roots = [
+        repo_root,
+        os.path.join(repo_root, "hf-space", "agent_skills"),
+        os.path.dirname(repo_root),
+    ]
+    return list(dict.fromkeys(r for r in roots if os.path.isdir(r)))
+
+
+EXAMPLE_ROOTS = _discover_example_roots()
+
+
 @app.post("/api/upload")
 async def upload_skill(file: UploadFile = File(...)):
     """Accept zip file or multiple files, extract, return file list + parsed SKILL.md metadata"""
     if not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Upload exceeds {MAX_UPLOAD_SIZE // (1024*1024)}MB limit")
+    content = await _read_limited(file, MAX_UPLOAD_SIZE)
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             skill_files = {}
             file_list = []
             for name in zf.namelist():
-                if name.endswith("/") or name.startswith("__MACOSX") or "/.DS_Store" in name or name.endswith(".DS_Store"):
+                if (
+                    name.endswith("/")
+                    or name.startswith("__MACOSX")
+                    or "/.DS_Store" in name
+                    or name.endswith(".DS_Store")
+                ):
                     continue
                 if not _is_safe_path(name):
                     logger.warning(f"Skipping unsafe zip entry: {name}")
@@ -176,7 +259,9 @@ async def upload_skill(file: UploadFile = File(...)):
                     continue
                 raw = zf.read(name)
                 if len(raw) > MAX_FILE_SIZE:
-                    logger.warning(f"Skipping oversized file: {name} ({len(raw)} bytes)")
+                    logger.warning(
+                        f"Skipping oversized file: {name} ({len(raw)} bytes)"
+                    )
                     continue
                 if len(file_list) >= MAX_FILE_COUNT:
                     logger.warning("Max file count reached, skipping remaining entries")
@@ -189,7 +274,9 @@ async def upload_skill(file: UploadFile = File(...)):
             if file_list:
                 common = os.path.commonpath(file_list)
                 if common and common != file_list[0]:
-                    skill_files = {os.path.relpath(k, common): v for k, v in skill_files.items()}
+                    skill_files = {
+                        os.path.relpath(k, common): v for k, v in skill_files.items()
+                    }
                     file_list = [os.path.relpath(f, common) for f in file_list]
 
             return create_session_from_files(skill_files, file_list)
@@ -206,12 +293,18 @@ async def upload_skill(file: UploadFile = File(...)):
 async def upload_files(files: List[UploadFile] = File(...)):
     """Accept multiple files (folder upload via webkitdirectory)"""
     if len(files) > MAX_FILE_COUNT:
-        raise HTTPException(status_code=413, detail=f"Too many files (max {MAX_FILE_COUNT})")
+        raise HTTPException(
+            status_code=413, detail=f"Too many files (max {MAX_FILE_COUNT})"
+        )
     skill_files = {}
     file_list = []
     total_size = 0
     for f in files:
-        if f.filename.startswith(".") or "/.DS_Store" in (f.filename or "") or "__MACOSX" in (f.filename or ""):
+        if (
+            f.filename.startswith(".")
+            or "/.DS_Store" in (f.filename or "")
+            or "__MACOSX" in (f.filename or "")
+        ):
             continue
         name = f.filename or "unknown"
         if not _is_safe_path(name):
@@ -220,12 +313,13 @@ async def upload_files(files: List[UploadFile] = File(...)):
         if not _is_allowed_file(name):
             logger.info(f"Skipping non-text file: {name}")
             continue
-        content = await f.read()
+        content = await _read_limited(f, MAX_FILE_SIZE)
         total_size += len(content)
         if total_size > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=413, detail=f"Total upload exceeds {MAX_UPLOAD_SIZE // (1024*1024)}MB limit")
-        if len(content) > MAX_FILE_SIZE:
-            logger.warning(f"Skipping oversized file: {name} ({len(content)} bytes)")
+            raise HTTPException(
+                status_code=413,
+                detail=f"Total upload exceeds {MAX_UPLOAD_SIZE // (1024 * 1024)}MB limit",
+            )
             continue
         skill_files[name] = content.decode("utf-8", errors="ignore")
         file_list.append(name)
@@ -234,7 +328,9 @@ async def upload_files(files: List[UploadFile] = File(...)):
     if file_list:
         common = os.path.commonpath(file_list)
         if common and common != file_list[0]:
-            skill_files = {os.path.relpath(k, common): v for k, v in skill_files.items()}
+            skill_files = {
+                os.path.relpath(k, common): v for k, v in skill_files.items()
+            }
             file_list = [os.path.relpath(f, common) for f in file_list]
 
     return create_session_from_files(skill_files, file_list)
@@ -255,13 +351,17 @@ async def analyze_skill(request: AnalyzeRequest):
         return {"scenarios": analysis["scenarios"], "evals": analysis["evals"]}
     except Exception as e:
         logger.error(f"Analysis error: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Analysis failed. Check your API key and try again.")
+        raise HTTPException(
+            status_code=500, detail="Analysis failed. Check your API key and try again."
+        )
 
 
 @app.post("/api/regenerate")
 async def regenerate_config(request: RegenerateRequest):
     """Regenerate scenarios/evals for a session"""
-    analyze_req = AnalyzeRequest(session_id=request.session_id, gemini_api_key=request.gemini_api_key)
+    analyze_req = AnalyzeRequest(
+        session_id=request.session_id, gemini_api_key=request.gemini_api_key
+    )
     return await analyze_skill(analyze_req)
 
 
@@ -296,9 +396,6 @@ async def stream_progress(session_id: str):
                 yield f"data: {json.dumps(event)}\n\n"
         except asyncio.CancelledError:
             pass
-        finally:
-            if "event_queue" in session:
-                del session["event_queue"]
 
     return StreamingResponse(
         event_generator(),
@@ -314,14 +411,16 @@ async def start_optimization(session_id: str, request: StartRequest):
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
     if not session.get("scenarios") or not session.get("evals"):
-        raise HTTPException(status_code=400, detail="Must configure scenarios and evals first")
+        raise HTTPException(
+            status_code=400, detail="Must configure scenarios and evals first"
+        )
     if session.get("status") == "running":
         raise HTTPException(status_code=400, detail="Optimization already running")
 
     session["status"] = "running"
     session["stop_requested"] = False
     # Pre-create the event queue so events aren't lost before SSE connects
-    session["event_queue"] = asyncio.Queue()
+    session["event_queue"] = asyncio.Queue(maxsize=SSE_QUEUE_MAX)
     gemini_key = request.gemini_api_key
 
     async def run_optimization():
@@ -330,24 +429,29 @@ async def start_optimization(session_id: str, request: StartRequest):
 
         async def callback(event):
             logger.info(f"Callback event: {event['type']}")
-            if "event_queue" in session:
-                await session["event_queue"].put(event)
+            _enqueue_event(session, event)
             if event["type"] == "baseline":
-                session["experiments"].append({
-                    "experiment_id": 0,
-                    "pass_rate": event["data"].get("score", 0),
-                    "status": "baseline",
-                    "per_eval": event["data"].get("per_eval", []),
-                })
+                session["experiments"].append(
+                    {
+                        "experiment_id": 0,
+                        "pass_rate": event["data"].get("score", 0),
+                        "status": "baseline",
+                        "per_eval": event["data"].get("per_eval", []),
+                    }
+                )
             elif event["type"] == "experiment_result":
-                session["experiments"].append({
-                    "experiment_id": event["data"].get("round", len(session["experiments"])),
-                    "pass_rate": event["data"].get("score", 0),
-                    "status": "keep" if event["data"].get("kept") else "discard",
-                    "per_eval": event["data"].get("per_eval", []),
-                    "description": event["data"].get("description", ""),
-                    "strategy": event["data"].get("strategy", ""),
-                })
+                session["experiments"].append(
+                    {
+                        "experiment_id": event["data"].get(
+                            "round", len(session["experiments"])
+                        ),
+                        "pass_rate": event["data"].get("score", 0),
+                        "status": "keep" if event["data"].get("kept") else "discard",
+                        "per_eval": event["data"].get("per_eval", []),
+                        "description": event["data"].get("description", ""),
+                        "strategy": event["data"].get("strategy", ""),
+                    }
+                )
             elif event["type"] == "complete":
                 session["status"] = "complete"
                 data = event["data"]
@@ -377,18 +481,23 @@ async def start_optimization(session_id: str, request: StartRequest):
                     "strategy_stats": data.get("strategy_stats", {}),
                 }
                 session["current_skill_md"] = data.get("improved_skill_md", "")
-                if "event_queue" in session:
-                    await session["event_queue"].put(None)
+                _enqueue_event(session, None)
 
         try:
             result = await optimizer.optimize(
                 skill_files=session["skill_files"],
                 scenarios=session["scenarios"],
                 evals=session["evals"],
-                max_rounds=request.max_rounds,
+                max_rounds=request.max_rounds or 5,
                 callback=callback,
+                should_stop=lambda: session.get("stop_requested", False),
             )
-            logger.info(f"Optimization complete: {result['baseline_score']}% -> {result['final_score']}%")
+            if session.get("status") == "stopped":
+                logger.info(f"Optimization stopped for session {session_id}")
+                return
+            logger.info(
+                f"Optimization complete: {result['baseline_score']}% -> {result['final_score']}%"
+            )
             # Don't overwrite final_result if callback already set it with transformed data
             if not session.get("final_result"):
                 ml = result.get("mutation_log", [])
@@ -420,9 +529,8 @@ async def start_optimization(session_id: str, request: StartRequest):
             logger.error(f"Optimization error: {traceback.format_exc()}")
             session["status"] = "error"
             session["error"] = str(e)
-            if "event_queue" in session:
-                await session["event_queue"].put({"type": "error", "data": {"message": str(e)}})
-                await session["event_queue"].put(None)
+            _enqueue_event(session, {"type": "error", "data": {"message": str(e)}})
+            _enqueue_event(session, None)
 
     asyncio.create_task(run_optimization())
     return {"status": "started"}
@@ -436,8 +544,7 @@ async def stop_optimization(session_id: str):
     session = sessions[session_id]
     session["stop_requested"] = True
     session["status"] = "stopped"
-    if "event_queue" in session:
-        await session["event_queue"].put(None)
+    _enqueue_event(session, None)
     return {"status": "stopped"}
 
 
@@ -459,9 +566,13 @@ async def download_skill(session_id: str):
                 else:
                     zf.writestr(filename, content)
             if session.get("final_result"):
-                changelog_content = json.dumps(session["final_result"]["changelog"], indent=2)
+                changelog_content = json.dumps(
+                    session["final_result"]["changelog"], indent=2
+                )
                 zf.writestr("CHANGELOG.json", changelog_content)
-        return FileResponse(zip_path, media_type="application/zip", filename="improved_skill.zip")
+        return FileResponse(
+            zip_path, media_type="application/zip", filename="improved_skill.zip"
+        )
     finally:
         asyncio.create_task(cleanup_temp_dir(temp_dir))
 
@@ -479,17 +590,26 @@ async def list_examples():
     """List available example skills"""
     # Sibling skills in this repo double as examples — the app demos on real
     # skills (e.g. project-graveyard), not on toy prompt files.
-    examples_dir = os.path.join(os.path.dirname(__file__), "..", "..")
     examples = []
-    if os.path.exists(examples_dir):
-        for name in sorted(os.listdir(examples_dir)):
-            skill_dir = os.path.join(examples_dir, name)
+    seen = set()
+    for root in EXAMPLE_ROOTS:
+        for name in sorted(os.listdir(root)):
+            if name in seen:
+                continue
+            skill_dir = os.path.join(root, name)
             skill_md_path = os.path.join(skill_dir, "SKILL.md")
             if os.path.isdir(skill_dir) and os.path.exists(skill_md_path):
+                seen.add(name)
                 with open(skill_md_path, "r") as f:
                     content = f.read()
                 metadata = parse_skill_frontmatter(content)
-                examples.append({"name": metadata.get("name", name), "description": metadata.get("description", ""), "path": name})
+                examples.append(
+                    {
+                        "name": metadata.get("name", name),
+                        "description": metadata.get("description", ""),
+                        "path": name,
+                    }
+                )
     return {"examples": examples}
 
 
@@ -498,24 +618,39 @@ async def load_example(example_name: str):
     """Load an example skill as if it were uploaded"""
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", example_name):
         raise HTTPException(status_code=400, detail="Invalid example name")
-    examples_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    skill_dir = os.path.realpath(os.path.join(examples_dir, example_name))
-    if not skill_dir.startswith(examples_dir + os.sep):
-        raise HTTPException(status_code=400, detail="Invalid example name")
-    if not os.path.isdir(skill_dir):
-        raise HTTPException(status_code=404, detail="Example skill not found")
-    skill_files = {}
-    file_list = []
-    for root, dirs, files in os.walk(skill_dir):
-        for fname in files:
-            if fname.startswith("."):
-                continue
-            full_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(full_path, skill_dir)
-            with open(full_path, "r") as f:
-                skill_files[rel_path] = f.read()
-            file_list.append(rel_path)
-    return create_session_from_files(skill_files, file_list)
+    for root in EXAMPLE_ROOTS:
+        real_root = os.path.realpath(root)
+        skill_dir = os.path.realpath(os.path.join(real_root, example_name))
+        if not skill_dir.startswith(real_root + os.sep):
+            continue
+        if not os.path.isdir(skill_dir) or not os.path.exists(
+            os.path.join(skill_dir, "SKILL.md")
+        ):
+            continue
+        skill_files = {}
+        file_list = []
+        total_size = 0
+        for root_dir, dirs, files in os.walk(skill_dir):
+            for fname in files:
+                if fname.startswith(".") or not _is_allowed_file(fname):
+                    continue
+                full_path = os.path.join(root_dir, fname)
+                rel_path = os.path.relpath(full_path, skill_dir)
+                if os.path.getsize(full_path) > MAX_FILE_SIZE:
+                    logger.warning(f"Skipping oversized example file: {rel_path}")
+                    continue
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                total_size += len(content.encode("utf-8"))
+                if total_size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Example exceeds {MAX_UPLOAD_SIZE // (1024 * 1024)}MB limit",
+                    )
+                skill_files[rel_path] = content
+                file_list.append(rel_path)
+        return create_session_from_files(skill_files, file_list)
+    raise HTTPException(status_code=404, detail="Example skill not found")
 
 
 @app.get("/api/status/{session_id}")
@@ -537,8 +672,7 @@ async def health_check():
     return {"status": "healthy"}
 
 
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8891)
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8891")))

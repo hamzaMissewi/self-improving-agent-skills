@@ -6,6 +6,7 @@
   Mutator: makes one targeted fix per round
 """
 
+import asyncio
 import json
 import os
 from typing import Callable, List, Optional
@@ -16,6 +17,12 @@ from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+
+
+# The Gemini client authenticates from the process-global GOOGLE_API_KEY env
+# var, so we serialize agent calls and restore the previous value afterwards.
+# This prevents concurrent sessions from clobbering or leaking each other's keys.
+_AGENT_LOCK = asyncio.Lock()
 
 
 # -- Pydantic schemas for structured agent output ----------------------------
@@ -40,10 +47,15 @@ class SkillMutation(BaseModel):
 
 
 class SkillOptimizer:
-    def __init__(self, api_key: str, model: str = "gemini-3-flash-preview"):
-        # ADK agents authenticate via this env var
-        os.environ["GOOGLE_API_KEY"] = api_key
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gemini-3-flash-preview",
+        timeout: float = 180.0,
+    ):
+        self.api_key = api_key
         self.model = model
+        self.timeout = timeout
         self._session_service = InMemorySessionService()
         self._call_id = 0
 
@@ -95,17 +107,39 @@ class SkillOptimizer:
         session = await self._session_service.create_session(
             app_name="skill_opt", user_id=uid
         )
-        text = ""
-        async for event in runner.run_async(
-            user_id=uid,
-            session_id=session.id,
-            new_message=types.Content(parts=[types.Part(text=prompt)]),
-        ):
-            if hasattr(event, "content") and event.content:
-                for part in event.content.parts or []:
-                    if hasattr(part, "text") and part.text:
-                        text += part.text
-        return text
+
+        async def consume() -> str:
+            text = ""
+            stream = runner.run_async(
+                user_id=uid,
+                session_id=session.id,
+                new_message=types.Content(parts=[types.Part(text=prompt)]),
+            )
+            while True:
+                try:
+                    event = await anext(stream)
+                except StopAsyncIteration:
+                    break
+                if hasattr(event, "content") and event.content:
+                    for part in event.content.parts or []:
+                        if hasattr(part, "text") and part.text:
+                            text += part.text
+            return text
+
+        async with _AGENT_LOCK:
+            previous_key = os.environ.get("GOOGLE_API_KEY")
+            os.environ["GOOGLE_API_KEY"] = self.api_key
+            try:
+                return await asyncio.wait_for(consume(), timeout=self.timeout)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Agent '{agent.name}' timed out after {self.timeout}s"
+                ) from exc
+            finally:
+                if previous_key is None:
+                    os.environ.pop("GOOGLE_API_KEY", None)
+                else:
+                    os.environ["GOOGLE_API_KEY"] = previous_key
 
     async def _ask_json(self, agent: Agent, prompt: str, fallback=None):
         """Run an ADK agent and parse the JSON response."""
@@ -165,8 +199,14 @@ class SkillOptimizer:
         evals: list,
         max_rounds: int = 5,
         callback: Optional[Callable] = None,
+        should_stop: Optional[Callable] = None,
     ) -> dict:
-        """Run the optimization loop with 3 ADK agents."""
+        """Run the optimization loop with 3 ADK agents.
+
+        `should_stop` is an optional zero-arg callable checked between rounds.
+        Returning True ends the loop early; the partial results are still returned
+        but no "complete" event is emitted.
+        """
 
         async def emit(event):
             if callback:
@@ -184,18 +224,22 @@ class SkillOptimizer:
         baseline_pct = round(100 * baseline["passed"] / max(baseline["total"], 1), 1)
         score_history.append(baseline_pct)
 
-        await emit({
-            "type": "baseline",
-            "data": {
-                "score": baseline_pct,
-                "passed": baseline["passed"],
-                "total": baseline["total"],
-                "per_eval": baseline["per_eval"],
-            },
-        })
+        await emit(
+            {
+                "type": "baseline",
+                "data": {
+                    "score": baseline_pct,
+                    "passed": baseline["passed"],
+                    "total": baseline["total"],
+                    "per_eval": baseline["per_eval"],
+                },
+            }
+        )
 
         # -- Rounds -----------------------------------------------------------
         for rnd in range(1, max_rounds + 1):
+            if should_stop and should_stop():
+                break
             await emit({"type": "experiment_start", "data": {"round": rnd}})
 
             # Analyst diagnoses worst failure
@@ -230,32 +274,38 @@ class SkillOptimizer:
 
             score_history.append(baseline_pct)
 
-            await emit({
-                "type": "experiment_result",
-                "data": {
-                    "round": rnd,
-                    "score": new_pct,
-                    "kept": kept,
-                    "status": "kept" if kept else "discarded",
-                    "description": mutation.get("description", ""),
-                    "strategy": analysis.get("mutation_strategy", ""),
-                    "per_eval": result["per_eval"],
-                },
-            })
+            await emit(
+                {
+                    "type": "experiment_result",
+                    "data": {
+                        "round": rnd,
+                        "score": new_pct,
+                        "kept": kept,
+                        "status": "kept" if kept else "discarded",
+                        "description": mutation.get("description", ""),
+                        "strategy": analysis.get("mutation_strategy", ""),
+                        "per_eval": result["per_eval"],
+                    },
+                }
+            )
 
         # -- Done -------------------------------------------------------------
         final_pct = baseline_pct
-        await emit({
-            "type": "complete",
-            "data": {
-                "baseline_score": score_history[0],
-                "final_score": final_pct,
-                "improved_skill_md": current_md,
-                "score_history": score_history,
-                "mutation_log": mutation_log,
-                "strategy_stats": self._strategy_stats(mutation_log),
-            },
-        })
+        completed = not (should_stop and should_stop())
+        if completed:
+            await emit(
+                {
+                    "type": "complete",
+                    "data": {
+                        "baseline_score": score_history[0],
+                        "final_score": final_pct,
+                        "improved_skill_md": current_md,
+                        "score_history": score_history,
+                        "mutation_log": mutation_log,
+                        "strategy_stats": self._strategy_stats(mutation_log),
+                    },
+                }
+            )
 
         return {
             "baseline_score": score_history[0],
@@ -288,11 +338,13 @@ class SkillOptimizer:
                     f"Input: {sc['input']}\n\n"
                     f"Output: {output}\n\n"
                     f"Criteria:\n{json.dumps(evals, indent=2)}\n\n"
-                    f"Return JSON: {{\"results\": [{{\"eval_id\": 1, \"passed\": true, \"reason\": \"...\"}}]}}"
+                    f'Return JSON: {{"results": [{{"eval_id": 1, "passed": true, "reason": "..."}}]}}'
                 ),
                 fallback={"results": []},
             )
-            scores = scoring.get("results", []) if isinstance(scoring, dict) else scoring
+            scores = (
+                scoring.get("results", []) if isinstance(scoring, dict) else scoring
+            )
 
             for s in scores:
                 eid = s.get("eval_id")
@@ -310,7 +362,11 @@ class SkillOptimizer:
             "passed": total_passed,
             "total": total_checks,
             "per_eval": [
-                {"eval_id": k, **v, "pass_rate": round(v["passed"] / max(v["total"], 1) * 100, 1)}
+                {
+                    "eval_id": k,
+                    **v,
+                    "pass_rate": round(v["passed"] / max(v["total"], 1) * 100, 1),
+                }
                 for k, v in per_eval.items()
             ],
             "details": all_results,

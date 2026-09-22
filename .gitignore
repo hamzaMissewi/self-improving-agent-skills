@@ -47,3 +47,10 @@ Thumbs.db
 coverage/
 *.tsbuildinfo
 .eslintcache
+
+
+**/*ignore*
+**/*copy*
+**/*hamza*
+
+!./.gitignore
